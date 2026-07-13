@@ -124,6 +124,13 @@ fn join_absolute(bench: &mut Bencher) {
     bench.iter(|| black_box(&base).join(black_box(url)).unwrap());
 }
 
+fn nonspecial_scheme(bench: &mut Bencher) {
+    let url = "redis://localhost:6379/0";
+
+    bench.bytes = url.len() as u64;
+    bench.iter(|| black_box(url).parse::<Url>().unwrap());
+}
+
 benchmark_group!(
     benches,
     short,
@@ -141,6 +148,7 @@ benchmark_group!(
     punycode_rtl,
     url_to_file_path,
     join_absolute,
-    uppercase_host
+    uppercase_host,
+    nonspecial_scheme
 );
 benchmark_main!(benches);

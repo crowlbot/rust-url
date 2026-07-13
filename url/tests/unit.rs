@@ -1494,6 +1494,24 @@ fn test_fast_path_parse() {
         assert_eq!(url.as_str(), expected, "input {input:?}");
     }
 
+    // Non-special schemes with an authority: serialized verbatim (opaque host,
+    // no host lower-casing, no default port, empty path stays empty).
+    let accepted_nonspecial = [
+        ("redis://localhost:6379/0", "redis://localhost:6379/0"),
+        ("redis://host", "redis://host"), // no implied trailing slash
+        ("postgres://h/db?x=1#f", "postgres://h/db?x=1#f"),
+        ("s3://bucket", "s3://bucket"),
+        ("redis://HOST/p", "redis://HOST/p"), // opaque host NOT lower-cased
+        ("web+demo://h/p", "web+demo://h/p"),
+        ("redis://127.0.0.1/x", "redis://127.0.0.1/x"), // opaque, not IPv4
+        ("redis://h:0/", "redis://h:0/"),               // any port kept
+    ];
+    for (input, expected) in accepted_nonspecial {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+        url.check_invariants().unwrap();
+    }
+
     // The fast path is also used by `join` when the argument is a complete
     // absolute special URL: the base must not affect the result.
     let base = Url::parse("https://base.example/a/b?c#d").unwrap();

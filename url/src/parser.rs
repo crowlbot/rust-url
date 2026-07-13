@@ -399,6 +399,11 @@ impl Parser<'_> {
                 debug_check_fast_parse(self.base_url, input, &url);
                 return Ok(url);
             }
+            if let Some(url) = try_fast_parse_nonspecial(input) {
+                #[cfg(debug_assertions)]
+                debug_check_fast_parse(self.base_url, input, &url);
+                return Ok(url);
+            }
         }
         self.parse_url_slow(input)
     }
@@ -1758,6 +1763,29 @@ fn is_verbatim_fragment_byte(b: u8) -> bool {
     matches!(b, b'!'..=b'~') && !matches!(b, b'"' | b'<' | b'>' | b'`')
 }
 
+/// Is `b` an opaque-host byte a non-special URL passes through verbatim?
+/// Excludes the forbidden host code points and `%` (kept conservative).
+#[inline]
+fn is_verbatim_opaque_host_byte(b: u8) -> bool {
+    // https://url.spec.whatwg.org/#forbidden-host-code-point (plus `%`).
+    matches!(b, b'!'..=b'~')
+        && !matches!(
+            b,
+            b'#' | b'%'
+                | b'/'
+                | b':'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'@'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'^'
+                | b'|'
+        )
+}
+
 /// A single-pass fast path for already-normalized absolute special URLs.
 ///
 /// Returns `Some(url)` only when `input` is a `http`/`https`/`ws`/`wss`/`ftp`
@@ -1946,6 +1974,152 @@ fn try_fast_parse(input: &str) -> Option<Url> {
         host: HostInternal::Domain,
         port,
         path_start,
+        query_start,
+        fragment_start,
+    })
+}
+
+/// A single-pass fast path for already-normalized absolute *non-special* URLs
+/// with an authority (e.g. `redis://`, `postgres://`, `web+demo://…`).
+///
+/// Non-special URLs are serialized verbatim — the host is an opaque host that
+/// is neither lower-cased nor IDNA-processed, there is no default port, and an
+/// empty path stays empty. So `Some(url)` is returned only when the input needs
+/// no transformation at all: a clean ASCII opaque host with no credentials, a
+/// canonical port, and path/query/fragment that need no percent-encoding or
+/// dot-segment normalization. Anything else defers to the general parser.
+fn try_fast_parse_nonspecial(input: &str) -> Option<Url> {
+    let bytes = input.as_bytes();
+    if bytes.len() > u32::MAX as usize {
+        return None;
+    }
+
+    // Scheme: lower-case `[a-z][a-z0-9+.-]*` followed by "://".
+    match bytes.first() {
+        Some(&b) if b.is_ascii_lowercase() => {}
+        _ => return None,
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'a'..=b'z' | b'0'..=b'9' | b'+' | b'-' | b'.' => i += 1,
+            b':' => break,
+            _ => return None,
+        }
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    let scheme_end = i as u32;
+    // Only non-special schemes; special/file are handled elsewhere.
+    if SchemeType::from(&input[..i]) != SchemeType::NotSpecial {
+        return None;
+    }
+    if bytes.get(i + 1) != Some(&b'/') || bytes.get(i + 2) != Some(&b'/') {
+        return None;
+    }
+    let host_start = i + 3;
+
+    // Opaque host: verbatim ASCII, no forbidden host code points, no `%`.
+    i = host_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b':' | b'/' | b'?' | b'#' => break,
+            b if is_verbatim_opaque_host_byte(b) => i += 1,
+            _ => return None,
+        }
+    }
+    let host_end = i;
+    if host_end == host_start {
+        return None; // empty host — defer
+    }
+
+    // Optional port. Non-special schemes have no default port, so any canonical
+    // (in-range, no-leading-zero) port is kept verbatim.
+    let mut port = None;
+    if bytes.get(i) == Some(&b':') {
+        i += 1;
+        let port_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let port_str = &input[port_start..i];
+        if port_str.is_empty() || port_str.len() > 5 {
+            return None;
+        }
+        if port_str.len() > 1 && port_str.as_bytes()[0] == b'0' {
+            return None;
+        }
+        port = Some(port_str.parse::<u16>().ok()?);
+        match bytes.get(i) {
+            None | Some(b'/') | Some(b'?') | Some(b'#') => {}
+            _ => return None,
+        }
+    }
+    let authority_end = i;
+
+    // Path: verbatim bytes only, no `.`/`..` segments to normalize.
+    if bytes.get(authority_end) == Some(&b'/') {
+        while i < bytes.len() {
+            match bytes[i] {
+                b'?' | b'#' => break,
+                b if is_verbatim_path_byte(b) => i += 1,
+                _ => return None,
+            }
+        }
+        for segment in input[authority_end..i].split('/') {
+            if segment == "." || segment == ".." {
+                return None;
+            }
+        }
+    }
+
+    // Query (conservatively reusing the special-query set — it never encodes
+    // more than the non-special one, so accepting it is always sound).
+    let query_start = if bytes.get(i) == Some(&b'?') {
+        let start = i as u32;
+        i += 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'#' => break,
+                b if is_verbatim_special_query_byte(b) => i += 1,
+                _ => return None,
+            }
+        }
+        Some(start)
+    } else {
+        None
+    };
+
+    // Fragment.
+    let fragment_start = if bytes.get(i) == Some(&b'#') {
+        let start = i as u32;
+        i += 1;
+        while i < bytes.len() {
+            if is_verbatim_fragment_byte(bytes[i]) {
+                i += 1;
+            } else {
+                return None;
+            }
+        }
+        Some(start)
+    } else {
+        None
+    };
+
+    debug_assert_eq!(i, bytes.len());
+
+    // Non-special URLs are serialized exactly as given (no host lower-casing,
+    // no implied path), so the serialization is the input verbatim.
+    Some(Url {
+        serialization: String::from(input),
+        scheme_end,
+        username_end: host_start as u32,
+        host_start: host_start as u32,
+        host_end: host_end as u32,
+        host: HostInternal::Domain,
+        port,
+        path_start: authority_end as u32,
         query_start,
         fragment_start,
     })
