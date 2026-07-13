@@ -3086,7 +3086,11 @@ fn file_url_segments_to_pathbuf(
 
     for segment in segments {
         bytes.push(b'/');
-        bytes.extend(percent_decode(segment.as_bytes()));
+        // `percent_decode(..).into()` yields a `Cow::Borrowed` when the segment
+        // has nothing to decode (no `%`), which is the common case; copying the
+        // slice in bulk is much faster than the byte-at-a-time decode iterator.
+        let decoded: Cow<'_, [u8]> = percent_decode(segment.as_bytes()).into();
+        bytes.extend_from_slice(&decoded);
     }
 
     // A windows drive letter must end with a slash.
