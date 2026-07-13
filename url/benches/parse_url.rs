@@ -109,6 +109,14 @@ fn url_to_file_path(bench: &mut Bencher) {
     });
 }
 
+fn join_absolute(bench: &mut Bencher) {
+    let base = Url::parse("https://example.com/foo/bar").unwrap();
+    let url = "https://example.com/parkbench?tre=es&st=uff";
+
+    bench.bytes = url.len() as u64;
+    bench.iter(|| black_box(&base).join(black_box(url)).unwrap());
+}
+
 benchmark_group!(
     benches,
     short,
@@ -124,6 +132,7 @@ benchmark_group!(
     punycode_ltr,
     unicode_rtl,
     punycode_rtl,
-    url_to_file_path
+    url_to_file_path,
+    join_absolute
 );
 benchmark_main!(benches);

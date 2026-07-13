@@ -383,17 +383,20 @@ impl Parser<'_> {
         // that require normalization or percent-encoding, avoiding the general
         // state machine entirely.
         //
-        // Only used for the plain `Url::parse` configuration (no base URL, no
-        // syntax-violation callback, no query encoding override, URL-parser
-        // context); anything else falls through to the full parser.
-        if self.base_url.is_none()
-            && self.violation_fn.is_none()
+        // Requires the plain configuration (no syntax-violation callback, no
+        // query encoding override, URL-parser context); anything else falls
+        // through to the full parser. A base URL is fine: `try_fast_parse` only
+        // accepts complete absolute special URLs (scheme + "//"), and per the
+        // WHATWG algorithm such an input is resolved without consulting the
+        // base, so `base.join(abs)` yields the same result as parsing `abs`
+        // standalone. This makes `Url::join` with an absolute argument fast too.
+        if self.violation_fn.is_none()
             && self.query_encoding_override.is_none()
             && self.context == Context::UrlParser
         {
             if let Some(url) = try_fast_parse(input) {
                 #[cfg(debug_assertions)]
-                debug_check_fast_parse(input, &url);
+                debug_check_fast_parse(self.base_url, input, &url);
                 return Ok(url);
             }
         }
@@ -1932,13 +1935,14 @@ fn try_fast_parse(input: &str) -> Option<Url> {
 }
 
 /// Debug-only guard: assert the fast path produces exactly what the general
-/// parser would. Runs on every fast-path hit in debug builds (e.g. the test
-/// suite), so any divergence fails loudly.
+/// parser would for the same base URL. Runs on every fast-path hit in debug
+/// builds (e.g. the test suite), so any divergence — including an incorrect
+/// base-URL interaction — fails loudly.
 #[cfg(debug_assertions)]
-fn debug_check_fast_parse(input: &str, fast: &Url) {
+fn debug_check_fast_parse(base_url: Option<&Url>, input: &str, fast: &Url) {
     let slow = Parser {
         serialization: String::with_capacity(input.len()),
-        base_url: None,
+        base_url,
         query_encoding_override: None,
         violation_fn: None,
         context: Context::UrlParser,

@@ -1489,4 +1489,22 @@ fn test_fast_path_parse() {
         let url = Url::parse(input).unwrap();
         assert_eq!(url.as_str(), expected, "input {input:?}");
     }
+
+    // The fast path is also used by `join` when the argument is a complete
+    // absolute special URL: the base must not affect the result.
+    let base = Url::parse("https://base.example/a/b?c#d").unwrap();
+    for (input, _) in accepted {
+        assert_eq!(
+            base.join(input).unwrap(),
+            Url::parse(input).unwrap(),
+            "join vs parse for {input:?}"
+        );
+    }
+    for (input, _, _) in accepted_with_port {
+        assert_eq!(
+            base.join(input).unwrap(),
+            Url::parse(input).unwrap(),
+            "join vs parse for {input:?}"
+        );
+    }
 }
