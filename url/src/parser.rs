@@ -1748,6 +1748,42 @@ fn is_verbatim_path_byte(b: u8) -> bool {
         )
 }
 
+/// Parse `host` as an already-canonical dotted-decimal IPv4 address: exactly
+/// four base-10 octets in `0..=255` with no redundant leading zeros. Returns
+/// `None` for any other form (leading zeros, hex/octal, fewer than four parts),
+/// which the general IPv4 parser would rewrite and so must not be fast-pathed.
+/// A canonical address's serialization equals the input host verbatim.
+fn parse_canonical_ipv4(host: &str) -> Option<crate::net::Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut parts = host.split('.');
+    for slot in octets.iter_mut() {
+        let part = parts.next()?.as_bytes();
+        if part.is_empty() || part.len() > 3 {
+            return None;
+        }
+        if part.len() > 1 && part[0] == b'0' {
+            return None; // a leading zero would be normalized away
+        }
+        let mut value = 0u16;
+        for &b in part {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            value = value * 10 + u16::from(b - b'0');
+        }
+        if value > 255 {
+            return None;
+        }
+        *slot = value as u8;
+    }
+    if parts.next().is_some() {
+        return None; // more than four parts
+    }
+    Some(crate::net::Ipv4Addr::new(
+        octets[0], octets[1], octets[2], octets[3],
+    ))
+}
+
 /// Does `segment` need dot-segment normalization? Matches exactly the segments
 /// the general parser rewrites: `.`/`..` and their `%2e`/`%2E` escape forms.
 #[inline]
@@ -1864,16 +1900,21 @@ fn try_fast_parse(input: &str) -> Option<Url> {
     } else {
         Cow::Borrowed(&input[host_start..host_end])
     };
-    // IPv4-looking hosts need numeric parsing/normalization.
-    if crate::host::ends_in_a_number(&host) {
-        return None;
-    }
-    // `xn--` (punycode) labels must be decoded and validated by IDNA, which can
-    // legitimately reject them; leave those to the general parser. (The ACE
-    // prefix is case-insensitive, so this is checked on the lower-cased host.)
-    if host.split('.').any(|label| label.starts_with("xn--")) {
-        return None;
-    }
+    // An IPv4-looking host must be parsed/normalized. Only an already-canonical
+    // dotted-decimal address serializes verbatim; other forms (leading zeros,
+    // hex/octal, fewer than four parts) are left to the general parser.
+    let host_internal = if crate::host::ends_in_a_number(&host) {
+        // `?` defers non-canonical forms (leading zeros, hex/octal, <4 parts).
+        HostInternal::Ipv4(parse_canonical_ipv4(&host)?)
+    } else {
+        // `xn--` (punycode) labels must be decoded and validated by IDNA, which
+        // can legitimately reject them; leave those to the general parser. (The
+        // ACE prefix is case-insensitive, checked here on the lower-cased host.)
+        if host.split('.').any(|label| label.starts_with("xn--")) {
+            return None;
+        }
+        HostInternal::Domain
+    };
 
     // Optional port. Only accept a port that is already in canonical form, i.e.
     // one the general parser would serialize verbatim: all digits, in range, no
@@ -1991,7 +2032,7 @@ fn try_fast_parse(input: &str) -> Option<Url> {
         username_end: host_start as u32,
         host_start: host_start as u32,
         host_end: host_end as u32,
-        host: HostInternal::Domain,
+        host: host_internal,
         port,
         path_start,
         query_start,

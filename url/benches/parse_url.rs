@@ -138,6 +138,13 @@ fn encoded_path(bench: &mut Bencher) {
     bench.iter(|| black_box(url).parse::<Url>().unwrap());
 }
 
+fn ipv4_host(bench: &mut Bencher) {
+    let url = "https://192.168.1.1/status";
+
+    bench.bytes = url.len() as u64;
+    bench.iter(|| black_box(url).parse::<Url>().unwrap());
+}
+
 benchmark_group!(
     benches,
     short,
@@ -157,6 +164,7 @@ benchmark_group!(
     join_absolute,
     uppercase_host,
     encoded_path,
+    ipv4_host,
     nonspecial_scheme
 );
 benchmark_main!(benches);

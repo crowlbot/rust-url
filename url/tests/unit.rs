@@ -1449,6 +1449,9 @@ fn test_fast_path_parse() {
             "https://en.wikipedia.org/wiki/C%2B%2B",
             "https://en.wikipedia.org/wiki/C%2B%2B",
         ),
+        // Canonical dotted-decimal IPv4 hosts pass through verbatim.
+        ("https://192.168.1.1/status", "https://192.168.1.1/status"),
+        ("http://10.0.0.255/", "http://10.0.0.255/"),
         ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
         (
             "https://Example.COM/PaTh?Q=x#F",
@@ -1473,6 +1476,7 @@ fn test_fast_path_parse() {
         ("http://a:1", "http://a:1/", 1),
         ("ws://a.b:65535/x?y#z", "ws://a.b:65535/x?y#z", 65535),
         ("http://a:443/", "http://a:443/", 443), // 443 is not http's default
+        ("https://127.0.0.1:8443/x", "https://127.0.0.1:8443/x", 8443), // ipv4 + port
     ];
     for (input, expected, port) in accepted_with_port {
         let url = Url::parse(input).unwrap();
@@ -1486,7 +1490,9 @@ fn test_fast_path_parse() {
         ("https://user@example.com/", "https://user@example.com/"), // credentials
         ("https://example.com/a/../b", "https://example.com/b"),    // dot segments
         ("https://example.com/a b", "https://example.com/a%20b"),   // needs encoding
-        ("https://127.0.0.1/", "https://127.0.0.1/"),               // ipv4
+        ("https://192.168.01.1/", "https://192.168.1.1/"),          // ipv4 leading zero
+        ("https://0x7f.0.0.1/", "https://127.0.0.1/"),              // ipv4 hex form
+        ("https://1.2.3/", "https://1.2.0.3/"),                     // ipv4 short form
         ("https://example.com/%2e/b", "https://example.com/b"),     // percent dot-segment
         ("https://example.com/x/%2e%2e/y", "https://example.com/y"), // percent double-dot
         ("https://example.com/a/%2E/b", "https://example.com/a/b"), // upper-hex dot-segment
