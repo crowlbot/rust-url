@@ -1412,3 +1412,135 @@ fn test_path_percent_encode() {
     let url = Url::parse("http://localhost/a}b").unwrap();
     assert_eq!(url.path(), "/a%7Db");
 }
+
+/// Exercise the normalized-absolute-URL fast path against inputs it accepts
+/// and inputs it must defer on. Every case must produce a correct URL
+/// identical to what the general parser yields (the parser also cross-checks
+/// this in debug builds).
+#[test]
+fn test_fast_path_parse() {
+    // Accepted by the fast path: byte-identical serialization (bar implied `/`).
+    let accepted = [
+        ("https://example.com", "https://example.com/"),
+        ("http://example.com/", "http://example.com/"),
+        ("https://example.com/bench", "https://example.com/bench"),
+        (
+            "https://example.com/parkbench?tre=es&st=uff",
+            "https://example.com/parkbench?tre=es&st=uff",
+        ),
+        (
+            "https://example.com/parkbench?tre=es&st=uff#fragment",
+            "https://example.com/parkbench?tre=es&st=uff#fragment",
+        ),
+        ("https://example.com?q", "https://example.com/?q"),
+        ("https://example.com#f", "https://example.com/#f"),
+        (
+            "https://hyphenated-example.com/",
+            "https://hyphenated-example.com/",
+        ),
+        ("https://1test.example/", "https://1test.example/"),
+        ("ws://a.b/c", "ws://a.b/c"),
+        ("wss://a.b/c", "wss://a.b/c"),
+        ("ftp://a.b/c", "ftp://a.b/c"),
+        ("http://a/b/c/d", "http://a/b/c/d"),
+        // Percent-escapes in the path pass through verbatim (not dot-segments).
+        ("https://example.com/a%20b", "https://example.com/a%20b"),
+        (
+            "https://en.wikipedia.org/wiki/C%2B%2B",
+            "https://en.wikipedia.org/wiki/C%2B%2B",
+        ),
+        // Canonical dotted-decimal IPv4 hosts pass through verbatim.
+        ("https://192.168.1.1/status", "https://192.168.1.1/status"),
+        ("http://10.0.0.255/", "http://10.0.0.255/"),
+        ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
+        (
+            "https://Example.COM/PaTh?Q=x#F",
+            "https://example.com/PaTh?Q=x#F",
+        ), // host lower-cased, rest kept
+    ];
+    for (input, expected) in accepted {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+        assert!(url.host_str().is_some(), "input {:?}", input);
+        assert_eq!(url.port(), None, "input {input:?}");
+        url.check_invariants().unwrap();
+    }
+
+    // Canonical, non-default ports are also accepted by the fast path.
+    let accepted_with_port = [
+        (
+            "https://example.com:8080/",
+            "https://example.com:8080/",
+            8080,
+        ),
+        ("http://a:1", "http://a:1/", 1),
+        ("ws://a.b:65535/x?y#z", "ws://a.b:65535/x?y#z", 65535),
+        ("http://a:443/", "http://a:443/", 443), // 443 is not http's default
+        ("https://127.0.0.1:8443/x", "https://127.0.0.1:8443/x", 8443), // ipv4 + port
+    ];
+    for (input, expected, port) in accepted_with_port {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+        assert_eq!(url.port(), Some(port), "input {input:?}");
+        url.check_invariants().unwrap();
+    }
+
+    // Deferred to the general parser; results must still be correct.
+    let deferred = [
+        ("https://user@example.com/", "https://user@example.com/"), // credentials
+        ("https://example.com/a/../b", "https://example.com/b"),    // dot segments
+        ("https://example.com/a b", "https://example.com/a%20b"),   // needs encoding
+        ("https://192.168.01.1/", "https://192.168.1.1/"),          // ipv4 leading zero
+        ("https://0x7f.0.0.1/", "https://127.0.0.1/"),              // ipv4 hex form
+        ("https://1.2.3/", "https://1.2.0.3/"),                     // ipv4 short form
+        ("https://example.com/%2e/b", "https://example.com/b"),     // percent dot-segment
+        ("https://example.com/x/%2e%2e/y", "https://example.com/y"), // percent double-dot
+        ("https://example.com/a/%2E/b", "https://example.com/a/b"), // upper-hex dot-segment
+        ("http://a.b.c.xn--nxa/", "http://a.b.c.xn--nxa/"),         // punycode label
+        ("https:/example.com/", "https://example.com/"),            // single slash
+        ("HTTPS://example.com/", "https://example.com/"),           // upper scheme
+        ("https://example.com:443/", "https://example.com/"),       // default port stripped
+        ("http://example.com:80/", "http://example.com/"),          // default port stripped
+        ("http://example.com:08080/", "http://example.com:8080/"),  // leading-zero port normalized
+    ];
+    for (input, expected) in deferred {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+    }
+
+    // Non-special schemes with an authority: serialized verbatim (opaque host,
+    // no host lower-casing, no default port, empty path stays empty).
+    let accepted_nonspecial = [
+        ("redis://localhost:6379/0", "redis://localhost:6379/0"),
+        ("redis://host", "redis://host"), // no implied trailing slash
+        ("postgres://h/db?x=1#f", "postgres://h/db?x=1#f"),
+        ("s3://bucket", "s3://bucket"),
+        ("redis://HOST/p", "redis://HOST/p"), // opaque host NOT lower-cased
+        ("web+demo://h/p", "web+demo://h/p"),
+        ("redis://127.0.0.1/x", "redis://127.0.0.1/x"), // opaque, not IPv4
+        ("redis://h:0/", "redis://h:0/"),               // any port kept
+    ];
+    for (input, expected) in accepted_nonspecial {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+        url.check_invariants().unwrap();
+    }
+
+    // The fast path is also used by `join` when the argument is a complete
+    // absolute special URL: the base must not affect the result.
+    let base = Url::parse("https://base.example/a/b?c#d").unwrap();
+    for (input, _) in accepted {
+        assert_eq!(
+            base.join(input).unwrap(),
+            Url::parse(input).unwrap(),
+            "join vs parse for {input:?}"
+        );
+    }
+    for (input, _, _) in accepted_with_port {
+        assert_eq!(
+            base.join(input).unwrap(),
+            Url::parse(input).unwrap(),
+            "join vs parse for {input:?}"
+        );
+    }
+}
