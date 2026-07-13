@@ -1412,3 +1412,61 @@ fn test_path_percent_encode() {
     let url = Url::parse("http://localhost/a}b").unwrap();
     assert_eq!(url.path(), "/a%7Db");
 }
+
+/// Exercise the normalized-absolute-URL fast path against inputs it accepts
+/// and inputs it must defer on. Every case must produce a correct URL
+/// identical to what the general parser yields (the parser also cross-checks
+/// this in debug builds).
+#[test]
+fn test_fast_path_parse() {
+    // Accepted by the fast path: byte-identical serialization (bar implied `/`).
+    let accepted = [
+        ("https://example.com", "https://example.com/"),
+        ("http://example.com/", "http://example.com/"),
+        ("https://example.com/bench", "https://example.com/bench"),
+        (
+            "https://example.com/parkbench?tre=es&st=uff",
+            "https://example.com/parkbench?tre=es&st=uff",
+        ),
+        (
+            "https://example.com/parkbench?tre=es&st=uff#fragment",
+            "https://example.com/parkbench?tre=es&st=uff#fragment",
+        ),
+        ("https://example.com?q", "https://example.com/?q"),
+        ("https://example.com#f", "https://example.com/#f"),
+        (
+            "https://hyphenated-example.com/",
+            "https://hyphenated-example.com/",
+        ),
+        ("https://1test.example/", "https://1test.example/"),
+        ("ws://a.b/c", "ws://a.b/c"),
+        ("wss://a.b/c", "wss://a.b/c"),
+        ("ftp://a.b/c", "ftp://a.b/c"),
+        ("http://a/b/c/d", "http://a/b/c/d"),
+    ];
+    for (input, expected) in accepted {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+        assert!(url.host_str().is_some(), "input {:?}", input);
+        assert_eq!(url.port(), None, "input {input:?}");
+        url.check_invariants().unwrap();
+    }
+
+    // Deferred to the general parser; results must still be correct.
+    let deferred = [
+        ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
+        ("https://example.com:8080/", "https://example.com:8080/"), // port
+        ("https://user@example.com/", "https://user@example.com/"), // credentials
+        ("https://example.com/a/../b", "https://example.com/b"), // dot segments
+        ("https://example.com/a b", "https://example.com/a%20b"), // needs encoding
+        ("https://127.0.0.1/", "https://127.0.0.1/"),     // ipv4
+        ("https://example.com/%2e/b", "https://example.com/b"), // percent dot-segment
+        ("http://a.b.c.xn--nxa/", "http://a.b.c.xn--nxa/"), // punycode label
+        ("https:/example.com/", "https://example.com/"),  // single slash
+        ("HTTPS://example.com/", "https://example.com/"), // upper scheme
+    ];
+    for (input, expected) in deferred {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+    }
+}

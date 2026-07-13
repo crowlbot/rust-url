@@ -273,7 +273,7 @@ fn longest_zero_sequence(pieces: &[u16; 8]) -> (isize, isize) {
 }
 
 /// <https://url.spec.whatwg.org/#ends-in-a-number-checker>
-fn ends_in_a_number(input: &str) -> bool {
+pub(crate) fn ends_in_a_number(input: &str) -> bool {
     let mut parts = input.rsplit('.');
     let last = parts.next().unwrap();
     let last = if last.is_empty() {

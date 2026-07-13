@@ -375,7 +375,32 @@ impl Parser<'_> {
     }
 
     /// https://url.spec.whatwg.org/#concept-basic-url-parser
-    pub fn parse_url(mut self, input: &str) -> ParseResult<Url> {
+    pub fn parse_url(self, input: &str) -> ParseResult<Url> {
+        // Fast path for already-normalized absolute http(s)/ws(s)/ftp URLs.
+        // Modeled on ada-url's `try_parse_simple_absolute` (ada-url/ada#1175):
+        // a single byte-scan handles the overwhelmingly common case of a
+        // well-formed special URL with a clean ASCII host and no components
+        // that require normalization or percent-encoding, avoiding the general
+        // state machine entirely.
+        //
+        // Only used for the plain `Url::parse` configuration (no base URL, no
+        // syntax-violation callback, no query encoding override, URL-parser
+        // context); anything else falls through to the full parser.
+        if self.base_url.is_none()
+            && self.violation_fn.is_none()
+            && self.query_encoding_override.is_none()
+            && self.context == Context::UrlParser
+        {
+            if let Some(url) = try_fast_parse(input) {
+                #[cfg(debug_assertions)]
+                debug_check_fast_parse(input, &url);
+                return Ok(url);
+            }
+        }
+        self.parse_url_slow(input)
+    }
+
+    fn parse_url_slow(mut self, input: &str) -> ParseResult<Url> {
         let input = Input::new_trim_c0_control_and_space(input, self.violation_fn);
         if let Ok(remaining) = self.parse_scheme(input.clone()) {
             return self.parse_with_scheme(remaining);
@@ -1698,6 +1723,218 @@ impl Parser<'_> {
             check_url_code_point(vfn, c, input)
         }
     }
+}
+
+/// Is `b` a path byte that the URL parser would pass through verbatim (no
+/// percent-encoding, no special handling)? Excludes `%` because `%2e`-style
+/// escapes are treated as dot path segments, and excludes `\` which is a
+/// segment separator in special URLs.
+#[inline]
+fn is_verbatim_path_byte(b: u8) -> bool {
+    // https://url.spec.whatwg.org/#path-percent-encode-set kept out, plus `%`
+    // (which would form `%2e` dot escapes) and `\` (a special-URL separator).
+    matches!(b, b'!'..=b'~')
+        && !matches!(
+            b,
+            b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'\\' | b'^' | b'`' | b'{' | b'}'
+        )
+}
+
+/// Is `b` a query byte that a special URL would pass through verbatim?
+/// (Special URLs additionally percent-encode `'`.)
+#[inline]
+fn is_verbatim_special_query_byte(b: u8) -> bool {
+    // https://url.spec.whatwg.org/#special-query-percent-encode-set (kept out).
+    matches!(b, b'!'..=b'~') && !matches!(b, b'"' | b'#' | b'<' | b'>' | b'\'')
+}
+
+/// Is `b` a fragment byte that the URL parser would pass through verbatim?
+#[inline]
+fn is_verbatim_fragment_byte(b: u8) -> bool {
+    // https://url.spec.whatwg.org/#fragment-percent-encode-set (kept out).
+    matches!(b, b'!'..=b'~') && !matches!(b, b'"' | b'<' | b'>' | b'`')
+}
+
+/// A single-pass fast path for already-normalized absolute special URLs.
+///
+/// Returns `Some(url)` only when `input` is a `http`/`https`/`ws`/`wss`/`ftp`
+/// URL whose serialization is byte-identical to the input (apart from an
+/// implied `/` path), so the result is exactly what the full parser would
+/// produce. Anything requiring lower-casing, percent-encoding, IDNA/punycode,
+/// credentials, a port, an IPv4 host, dot-segment normalization, or C0/tab/
+/// newline stripping returns `None` and defers to the general parser.
+fn try_fast_parse(input: &str) -> Option<Url> {
+    let bytes = input.as_bytes();
+    // Keep all offsets within `u32`; the general parser reports Overflow above this.
+    if bytes.len() > u32::MAX as usize {
+        return None;
+    }
+
+    // Scheme (lower-case only) immediately followed by "//".
+    let (scheme_end, host_start): (u32, usize) = if bytes.starts_with(b"https://") {
+        (5, 8)
+    } else if bytes.starts_with(b"http://") {
+        (4, 7)
+    } else if bytes.starts_with(b"wss://") {
+        (3, 6)
+    } else if bytes.starts_with(b"ws://") {
+        (2, 5)
+    } else if bytes.starts_with(b"ftp://") {
+        (3, 6)
+    } else {
+        return None;
+    };
+
+    // Host: a clean lower-case ASCII domain terminated by `/`, `?`, `#` or EOF.
+    let mut i = host_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' => i += 1,
+            b'/' | b'?' | b'#' => break,
+            _ => return None,
+        }
+    }
+    let host_end = i;
+    if host_end == host_start {
+        return None; // empty host
+    }
+    let host = &input[host_start..host_end];
+    // IPv4-looking hosts need numeric parsing/normalization.
+    if crate::host::ends_in_a_number(host) {
+        return None;
+    }
+    // `xn--` (punycode) labels must be decoded and validated by IDNA, which can
+    // legitimately reject them; leave those to the general parser.
+    if host.split('.').any(|label| label.starts_with("xn--")) {
+        return None;
+    }
+
+    // Path: verbatim bytes only, and no `.`/`..` segments to normalize.
+    let mut has_path = false;
+    if bytes.get(host_end) == Some(&b'/') {
+        has_path = true;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'?' | b'#' => break,
+                b if is_verbatim_path_byte(b) => i += 1,
+                _ => return None,
+            }
+        }
+        for segment in input[host_end..i].split('/') {
+            if segment == "." || segment == ".." {
+                return None;
+            }
+        }
+    }
+    let path_end = i;
+
+    // Query.
+    let query_range = if bytes.get(i) == Some(&b'?') {
+        i += 1;
+        let start = i;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'#' => break,
+                b if is_verbatim_special_query_byte(b) => i += 1,
+                _ => return None,
+            }
+        }
+        Some(start..i)
+    } else {
+        None
+    };
+
+    // Fragment.
+    let fragment_range = if bytes.get(i) == Some(&b'#') {
+        i += 1;
+        let start = i;
+        while i < bytes.len() {
+            if is_verbatim_fragment_byte(bytes[i]) {
+                i += 1;
+            } else {
+                return None;
+            }
+        }
+        Some(start..i)
+    } else {
+        None
+    };
+
+    debug_assert_eq!(i, bytes.len());
+
+    // Assemble. The serialization equals the input verbatim except that an
+    // absent path becomes "/".
+    let mut serialization = String::with_capacity(input.len() + 1);
+    serialization.push_str(&input[..host_end]);
+    let path_start = serialization.len() as u32;
+    if has_path {
+        serialization.push_str(&input[host_end..path_end]);
+    } else {
+        serialization.push('/');
+    }
+    let query_start = query_range.map(|r| {
+        let start = serialization.len() as u32;
+        serialization.push('?');
+        serialization.push_str(&input[r]);
+        start
+    });
+    let fragment_start = fragment_range.map(|r| {
+        let start = serialization.len() as u32;
+        serialization.push('#');
+        serialization.push_str(&input[r]);
+        start
+    });
+
+    Some(Url {
+        serialization,
+        scheme_end,
+        username_end: host_start as u32,
+        host_start: host_start as u32,
+        host_end: host_end as u32,
+        host: HostInternal::Domain,
+        port: None,
+        path_start,
+        query_start,
+        fragment_start,
+    })
+}
+
+/// Debug-only guard: assert the fast path produces exactly what the general
+/// parser would. Runs on every fast-path hit in debug builds (e.g. the test
+/// suite), so any divergence fails loudly.
+#[cfg(debug_assertions)]
+fn debug_check_fast_parse(input: &str, fast: &Url) {
+    let slow = Parser {
+        serialization: String::with_capacity(input.len()),
+        base_url: None,
+        query_encoding_override: None,
+        violation_fn: None,
+        context: Context::UrlParser,
+    }
+    .parse_url_slow(input)
+    .expect("fast path accepted an input the general parser rejects");
+    assert_eq!(
+        fast.serialization, slow.serialization,
+        "fast/slow serialization mismatch for {input:?}"
+    );
+    assert_eq!(fast.scheme_end, slow.scheme_end, "scheme_end for {input:?}");
+    assert_eq!(
+        fast.username_end, slow.username_end,
+        "username_end for {input:?}"
+    );
+    assert_eq!(fast.host_start, slow.host_start, "host_start for {input:?}");
+    assert_eq!(fast.host_end, slow.host_end, "host_end for {input:?}");
+    assert_eq!(fast.host, slow.host, "host for {input:?}");
+    assert_eq!(fast.port, slow.port, "port for {input:?}");
+    assert_eq!(fast.path_start, slow.path_start, "path_start for {input:?}");
+    assert_eq!(
+        fast.query_start, slow.query_start,
+        "query_start for {input:?}"
+    );
+    assert_eq!(
+        fast.fragment_start, slow.fragment_start,
+        "fragment_start for {input:?}"
+    );
 }
 
 fn check_url_code_point(vfn: &dyn Fn(SyntaxViolation), c: char, input: &Input<'_>) {
