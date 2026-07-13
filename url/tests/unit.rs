@@ -1443,6 +1443,12 @@ fn test_fast_path_parse() {
         ("wss://a.b/c", "wss://a.b/c"),
         ("ftp://a.b/c", "ftp://a.b/c"),
         ("http://a/b/c/d", "http://a/b/c/d"),
+        // Percent-escapes in the path pass through verbatim (not dot-segments).
+        ("https://example.com/a%20b", "https://example.com/a%20b"),
+        (
+            "https://en.wikipedia.org/wiki/C%2B%2B",
+            "https://en.wikipedia.org/wiki/C%2B%2B",
+        ),
         ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
         (
             "https://Example.COM/PaTh?Q=x#F",
@@ -1482,6 +1488,8 @@ fn test_fast_path_parse() {
         ("https://example.com/a b", "https://example.com/a%20b"),   // needs encoding
         ("https://127.0.0.1/", "https://127.0.0.1/"),               // ipv4
         ("https://example.com/%2e/b", "https://example.com/b"),     // percent dot-segment
+        ("https://example.com/x/%2e%2e/y", "https://example.com/y"), // percent double-dot
+        ("https://example.com/a/%2E/b", "https://example.com/a/b"), // upper-hex dot-segment
         ("http://a.b.c.xn--nxa/", "http://a.b.c.xn--nxa/"),         // punycode label
         ("https:/example.com/", "https://example.com/"),            // single slash
         ("HTTPS://example.com/", "https://example.com/"),           // upper scheme

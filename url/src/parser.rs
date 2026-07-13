@@ -1734,18 +1734,38 @@ impl Parser<'_> {
 }
 
 /// Is `b` a path byte that the URL parser would pass through verbatim (no
-/// percent-encoding, no special handling)? Excludes `%` because `%2e`-style
-/// escapes are treated as dot path segments, and excludes `\` which is a
-/// segment separator in special URLs.
+/// percent-encoding, no special handling)? `%` is allowed (it passes through
+/// unchanged; dot-escape segments like `%2e` are handled separately by
+/// [`is_dot_path_segment`]); `\` is excluded as a special-URL separator.
 #[inline]
 fn is_verbatim_path_byte(b: u8) -> bool {
-    // https://url.spec.whatwg.org/#path-percent-encode-set kept out, plus `%`
-    // (which would form `%2e` dot escapes) and `\` (a special-URL separator).
+    // https://url.spec.whatwg.org/#path-percent-encode-set kept out, plus `\`
+    // (a special-URL segment separator).
     matches!(b, b'!'..=b'~')
         && !matches!(
             b,
-            b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'\\' | b'^' | b'`' | b'{' | b'}'
+            b'"' | b'#' | b'<' | b'>' | b'?' | b'\\' | b'^' | b'`' | b'{' | b'}'
         )
+}
+
+/// Does `segment` need dot-segment normalization? Matches exactly the segments
+/// the general parser rewrites: `.`/`..` and their `%2e`/`%2E` escape forms.
+#[inline]
+fn is_dot_path_segment(segment: &str) -> bool {
+    matches!(
+        segment,
+        "." | ".."
+            | "%2e"
+            | "%2E"
+            | "%2e%2e"
+            | "%2e%2E"
+            | "%2E%2e"
+            | "%2E%2E"
+            | "%2e."
+            | "%2E."
+            | ".%2e"
+            | ".%2E"
+    )
 }
 
 /// Is `b` a query byte that a special URL would pass through verbatim?
@@ -1898,7 +1918,7 @@ fn try_fast_parse(input: &str) -> Option<Url> {
             }
         }
         for segment in input[authority_end..i].split('/') {
-            if segment == "." || segment == ".." {
+            if is_dot_path_segment(segment) {
                 return None;
             }
         }
@@ -2068,7 +2088,7 @@ fn try_fast_parse_nonspecial(input: &str) -> Option<Url> {
             }
         }
         for segment in input[authority_end..i].split('/') {
-            if segment == "." || segment == ".." {
+            if is_dot_path_segment(segment) {
                 return None;
             }
         }

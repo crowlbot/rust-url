@@ -131,6 +131,13 @@ fn nonspecial_scheme(bench: &mut Bencher) {
     bench.iter(|| black_box(url).parse::<Url>().unwrap());
 }
 
+fn encoded_path(bench: &mut Bencher) {
+    let url = "https://en.wikipedia.org/wiki/C%2B%2B%20programming";
+
+    bench.bytes = url.len() as u64;
+    bench.iter(|| black_box(url).parse::<Url>().unwrap());
+}
+
 benchmark_group!(
     benches,
     short,
@@ -149,6 +156,7 @@ benchmark_group!(
     url_to_file_path,
     join_absolute,
     uppercase_host,
+    encoded_path,
     nonspecial_scheme
 );
 benchmark_main!(benches);
