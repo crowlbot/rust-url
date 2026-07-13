@@ -1452,10 +1452,27 @@ fn test_fast_path_parse() {
         url.check_invariants().unwrap();
     }
 
+    // Canonical, non-default ports are also accepted by the fast path.
+    let accepted_with_port = [
+        (
+            "https://example.com:8080/",
+            "https://example.com:8080/",
+            8080,
+        ),
+        ("http://a:1", "http://a:1/", 1),
+        ("ws://a.b:65535/x?y#z", "ws://a.b:65535/x?y#z", 65535),
+        ("http://a:443/", "http://a:443/", 443), // 443 is not http's default
+    ];
+    for (input, expected, port) in accepted_with_port {
+        let url = Url::parse(input).unwrap();
+        assert_eq!(url.as_str(), expected, "input {input:?}");
+        assert_eq!(url.port(), Some(port), "input {input:?}");
+        url.check_invariants().unwrap();
+    }
+
     // Deferred to the general parser; results must still be correct.
     let deferred = [
         ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
-        ("https://example.com:8080/", "https://example.com:8080/"), // port
         ("https://user@example.com/", "https://user@example.com/"), // credentials
         ("https://example.com/a/../b", "https://example.com/b"), // dot segments
         ("https://example.com/a b", "https://example.com/a%20b"), // needs encoding
@@ -1464,6 +1481,9 @@ fn test_fast_path_parse() {
         ("http://a.b.c.xn--nxa/", "http://a.b.c.xn--nxa/"), // punycode label
         ("https:/example.com/", "https://example.com/"),  // single slash
         ("HTTPS://example.com/", "https://example.com/"), // upper scheme
+        ("https://example.com:443/", "https://example.com/"), // default port stripped
+        ("http://example.com:80/", "http://example.com/"), // default port stripped
+        ("http://example.com:08080/", "http://example.com:8080/"), // leading-zero port normalized
     ];
     for (input, expected) in deferred {
         let url = Url::parse(input).unwrap();

@@ -1760,9 +1760,10 @@ fn is_verbatim_fragment_byte(b: u8) -> bool {
 /// Returns `Some(url)` only when `input` is a `http`/`https`/`ws`/`wss`/`ftp`
 /// URL whose serialization is byte-identical to the input (apart from an
 /// implied `/` path), so the result is exactly what the full parser would
-/// produce. Anything requiring lower-casing, percent-encoding, IDNA/punycode,
-/// credentials, a port, an IPv4 host, dot-segment normalization, or C0/tab/
-/// newline stripping returns `None` and defers to the general parser.
+/// produce. A canonical (in-range, no-leading-zero, non-default) port is also
+/// accepted. Anything requiring lower-casing, percent-encoding, IDNA/punycode,
+/// credentials, port normalization, an IPv4 host, dot-segment normalization, or
+/// C0/tab/newline stripping returns `None` and defers to the general parser.
 fn try_fast_parse(input: &str) -> Option<Url> {
     let bytes = input.as_bytes();
     // Keep all offsets within `u32`; the general parser reports Overflow above this.
@@ -1785,12 +1786,12 @@ fn try_fast_parse(input: &str) -> Option<Url> {
         return None;
     };
 
-    // Host: a clean lower-case ASCII domain terminated by `/`, `?`, `#` or EOF.
+    // Host: a clean lower-case ASCII domain terminated by `:`, `/`, `?`, `#` or EOF.
     let mut i = host_start;
     while i < bytes.len() {
         match bytes[i] {
             b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' => i += 1,
-            b'/' | b'?' | b'#' => break,
+            b':' | b'/' | b'?' | b'#' => break,
             _ => return None,
         }
     }
@@ -1809,9 +1810,40 @@ fn try_fast_parse(input: &str) -> Option<Url> {
         return None;
     }
 
+    // Optional port. Only accept a port that is already in canonical form, i.e.
+    // one the general parser would serialize verbatim: all digits, in range, no
+    // redundant leading zeros, and not the scheme's default (which is dropped).
+    let mut port = None;
+    if bytes.get(i) == Some(&b':') {
+        i += 1;
+        let port_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let port_str = &input[port_start..i];
+        if port_str.is_empty() || port_str.len() > 5 {
+            return None;
+        }
+        if port_str.len() > 1 && port_str.as_bytes()[0] == b'0' {
+            return None; // leading zero would be normalized away
+        }
+        let value: u16 = port_str.parse().ok()?;
+        if default_port(&input[..scheme_end as usize]) == Some(value) {
+            return None; // default port is stripped by the general parser
+        }
+        // What follows the port must be a path delimiter or EOF.
+        match bytes.get(i) {
+            None | Some(b'/') | Some(b'?') | Some(b'#') => {}
+            _ => return None,
+        }
+        port = Some(value);
+    }
+    // Position where the path/query/fragment begins in the input.
+    let authority_end = i;
+
     // Path: verbatim bytes only, and no `.`/`..` segments to normalize.
     let mut has_path = false;
-    if bytes.get(host_end) == Some(&b'/') {
+    if bytes.get(authority_end) == Some(&b'/') {
         has_path = true;
         while i < bytes.len() {
             match bytes[i] {
@@ -1820,7 +1852,7 @@ fn try_fast_parse(input: &str) -> Option<Url> {
                 _ => return None,
             }
         }
-        for segment in input[host_end..i].split('/') {
+        for segment in input[authority_end..i].split('/') {
             if segment == "." || segment == ".." {
                 return None;
             }
@@ -1862,13 +1894,13 @@ fn try_fast_parse(input: &str) -> Option<Url> {
 
     debug_assert_eq!(i, bytes.len());
 
-    // Assemble. The serialization equals the input verbatim except that an
-    // absent path becomes "/".
+    // Assemble. The serialization equals the input verbatim (up to the
+    // authority) except that an absent path becomes "/".
     let mut serialization = String::with_capacity(input.len() + 1);
-    serialization.push_str(&input[..host_end]);
+    serialization.push_str(&input[..authority_end]);
     let path_start = serialization.len() as u32;
     if has_path {
-        serialization.push_str(&input[host_end..path_end]);
+        serialization.push_str(&input[authority_end..path_end]);
     } else {
         serialization.push('/');
     }
@@ -1892,7 +1924,7 @@ fn try_fast_parse(input: &str) -> Option<Url> {
         host_start: host_start as u32,
         host_end: host_end as u32,
         host: HostInternal::Domain,
-        port: None,
+        port,
         path_start,
         query_start,
         fragment_start,
