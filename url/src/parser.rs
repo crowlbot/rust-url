@@ -1763,8 +1763,9 @@ fn is_verbatim_fragment_byte(b: u8) -> bool {
 /// Returns `Some(url)` only when `input` is a `http`/`https`/`ws`/`wss`/`ftp`
 /// URL whose serialization is byte-identical to the input (apart from an
 /// implied `/` path), so the result is exactly what the full parser would
-/// produce. A canonical (in-range, no-leading-zero, non-default) port is also
-/// accepted. Anything requiring lower-casing, percent-encoding, IDNA/punycode,
+/// produce (the host is ASCII-lower-cased, which for a clean ASCII domain is
+/// IDNA's only effect). A canonical (in-range, no-leading-zero, non-default)
+/// port is also accepted. Anything requiring percent-encoding, IDNA/punycode,
 /// credentials, port normalization, an IPv4 host, dot-segment normalization, or
 /// C0/tab/newline stripping returns `None` and defers to the general parser.
 fn try_fast_parse(input: &str) -> Option<Url> {
@@ -1789,11 +1790,18 @@ fn try_fast_parse(input: &str) -> Option<Url> {
         return None;
     };
 
-    // Host: a clean lower-case ASCII domain terminated by `:`, `/`, `?`, `#` or EOF.
+    // Host: a clean ASCII domain terminated by `:`, `/`, `?`, `#` or EOF.
+    // ASCII upper-case is fine — for a domain made only of these bytes, IDNA's
+    // sole transformation is ASCII lower-casing, which we reproduce below.
     let mut i = host_start;
+    let mut host_has_upper = false;
     while i < bytes.len() {
         match bytes[i] {
             b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' => i += 1,
+            b'A'..=b'Z' => {
+                host_has_upper = true;
+                i += 1;
+            }
             b':' | b'/' | b'?' | b'#' => break,
             _ => return None,
         }
@@ -1802,13 +1810,19 @@ fn try_fast_parse(input: &str) -> Option<Url> {
     if host_end == host_start {
         return None; // empty host
     }
-    let host = &input[host_start..host_end];
+    // The normalized (lower-cased) host, borrowed when already lower-case.
+    let host: Cow<'_, str> = if host_has_upper {
+        Cow::Owned(input[host_start..host_end].to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(&input[host_start..host_end])
+    };
     // IPv4-looking hosts need numeric parsing/normalization.
-    if crate::host::ends_in_a_number(host) {
+    if crate::host::ends_in_a_number(&host) {
         return None;
     }
     // `xn--` (punycode) labels must be decoded and validated by IDNA, which can
-    // legitimately reject them; leave those to the general parser.
+    // legitimately reject them; leave those to the general parser. (The ACE
+    // prefix is case-insensitive, so this is checked on the lower-cased host.)
     if host.split('.').any(|label| label.starts_with("xn--")) {
         return None;
     }
@@ -1897,10 +1911,13 @@ fn try_fast_parse(input: &str) -> Option<Url> {
 
     debug_assert_eq!(i, bytes.len());
 
-    // Assemble. The serialization equals the input verbatim (up to the
-    // authority) except that an absent path becomes "/".
+    // Assemble. The serialization equals the input verbatim except that the
+    // host is lower-cased and an absent path becomes "/". Lower-casing preserves
+    // length, so all byte offsets computed above remain valid.
     let mut serialization = String::with_capacity(input.len() + 1);
-    serialization.push_str(&input[..authority_end]);
+    serialization.push_str(&input[..host_start]); // scheme://
+    serialization.push_str(&host); // (lower-cased) host
+    serialization.push_str(&input[host_end..authority_end]); // ":port", if any
     let path_start = serialization.len() as u32;
     if has_path {
         serialization.push_str(&input[authority_end..path_end]);

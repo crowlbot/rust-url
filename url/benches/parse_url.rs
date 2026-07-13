@@ -109,6 +109,13 @@ fn url_to_file_path(bench: &mut Bencher) {
     });
 }
 
+fn uppercase_host(bench: &mut Bencher) {
+    let url = "https://Example.COM/bench";
+
+    bench.bytes = url.len() as u64;
+    bench.iter(|| black_box(url).parse::<Url>().unwrap());
+}
+
 fn join_absolute(bench: &mut Bencher) {
     let base = Url::parse("https://example.com/foo/bar").unwrap();
     let url = "https://example.com/parkbench?tre=es&st=uff";
@@ -133,6 +140,7 @@ benchmark_group!(
     unicode_rtl,
     punycode_rtl,
     url_to_file_path,
-    join_absolute
+    join_absolute,
+    uppercase_host
 );
 benchmark_main!(benches);

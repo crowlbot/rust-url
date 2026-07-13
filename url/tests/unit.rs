@@ -1443,6 +1443,11 @@ fn test_fast_path_parse() {
         ("wss://a.b/c", "wss://a.b/c"),
         ("ftp://a.b/c", "ftp://a.b/c"),
         ("http://a/b/c/d", "http://a/b/c/d"),
+        ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
+        (
+            "https://Example.COM/PaTh?Q=x#F",
+            "https://example.com/PaTh?Q=x#F",
+        ), // host lower-cased, rest kept
     ];
     for (input, expected) in accepted {
         let url = Url::parse(input).unwrap();
@@ -1472,18 +1477,17 @@ fn test_fast_path_parse() {
 
     // Deferred to the general parser; results must still be correct.
     let deferred = [
-        ("https://EXAMPLE.com/", "https://example.com/"), // upper-case host
         ("https://user@example.com/", "https://user@example.com/"), // credentials
-        ("https://example.com/a/../b", "https://example.com/b"), // dot segments
-        ("https://example.com/a b", "https://example.com/a%20b"), // needs encoding
-        ("https://127.0.0.1/", "https://127.0.0.1/"),     // ipv4
-        ("https://example.com/%2e/b", "https://example.com/b"), // percent dot-segment
-        ("http://a.b.c.xn--nxa/", "http://a.b.c.xn--nxa/"), // punycode label
-        ("https:/example.com/", "https://example.com/"),  // single slash
-        ("HTTPS://example.com/", "https://example.com/"), // upper scheme
-        ("https://example.com:443/", "https://example.com/"), // default port stripped
-        ("http://example.com:80/", "http://example.com/"), // default port stripped
-        ("http://example.com:08080/", "http://example.com:8080/"), // leading-zero port normalized
+        ("https://example.com/a/../b", "https://example.com/b"),    // dot segments
+        ("https://example.com/a b", "https://example.com/a%20b"),   // needs encoding
+        ("https://127.0.0.1/", "https://127.0.0.1/"),               // ipv4
+        ("https://example.com/%2e/b", "https://example.com/b"),     // percent dot-segment
+        ("http://a.b.c.xn--nxa/", "http://a.b.c.xn--nxa/"),         // punycode label
+        ("https:/example.com/", "https://example.com/"),            // single slash
+        ("HTTPS://example.com/", "https://example.com/"),           // upper scheme
+        ("https://example.com:443/", "https://example.com/"),       // default port stripped
+        ("http://example.com:80/", "http://example.com/"),          // default port stripped
+        ("http://example.com:08080/", "http://example.com:8080/"),  // leading-zero port normalized
     ];
     for (input, expected) in deferred {
         let url = Url::parse(input).unwrap();
