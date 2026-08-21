@@ -257,6 +257,15 @@ fn after_percent_sign(iter: &mut slice::Iter<'_, u8>) -> Option<u8> {
     Some(h as u8 * 0x10 + l as u8)
 }
 
+/// Decode the two hex digits of a percent-escape starting at `idx` (the byte
+/// right after the `%`), returning `None` if they are missing or not hex.
+#[cfg(feature = "alloc")]
+fn decode_hex_pair(input: &[u8], idx: usize) -> Option<u8> {
+    let h = char::from(*input.get(idx)?).to_digit(16)?;
+    let l = char::from(*input.get(idx + 1)?).to_digit(16)?;
+    Some(h as u8 * 0x10 + l as u8)
+}
+
 impl Iterator for PercentDecode<'_> {
     type Item = u8;
 
@@ -290,19 +299,47 @@ impl<'a> PercentDecode<'a> {
     /// If the percent-decoding is different from the input, return it as a new bytes vector.
     #[cfg(feature = "alloc")]
     fn if_any(&self) -> Option<Vec<u8>> {
-        let mut bytes_iter = self.bytes.clone();
-        while bytes_iter.any(|&b| b == b'%') {
-            if let Some(decoded_byte) = after_percent_sign(&mut bytes_iter) {
-                let initial_bytes = self.bytes.as_slice();
-                let unchanged_bytes_len = initial_bytes.len() - bytes_iter.len() - 3;
-                let mut decoded = initial_bytes[..unchanged_bytes_len].to_owned();
-                decoded.push(decoded_byte);
-                decoded.extend(PercentDecode { bytes: bytes_iter });
-                return Some(decoded);
+        let input = self.bytes.as_slice();
+        // Locate the first `%` that begins a valid escape. Everything before it
+        // is unchanged, so if there is none we can borrow the input as-is.
+        let mut cursor = 0;
+        let (first_percent, first_byte) = loop {
+            let percent = cursor + input[cursor..].iter().position(|&b| b == b'%')?;
+            if let Some(byte) = decode_hex_pair(input, percent + 1) {
+                break (percent, byte);
+            }
+            // A bare `%` (not followed by two hex digits) is left as-is; keep looking.
+            cursor = percent + 1;
+        };
+
+        let mut decoded = Vec::with_capacity(input.len());
+        decoded.extend_from_slice(&input[..first_percent]);
+        decoded.push(first_byte);
+
+        // Decode the remainder, bulk-copying the unchanged runs between escapes
+        // instead of pushing one byte at a time.
+        let mut i = first_percent + 3;
+        while i < input.len() {
+            match input[i..].iter().position(|&b| b == b'%') {
+                Some(offset) => {
+                    let percent = i + offset;
+                    if let Some(byte) = decode_hex_pair(input, percent + 1) {
+                        decoded.extend_from_slice(&input[i..percent]);
+                        decoded.push(byte);
+                        i = percent + 3;
+                    } else {
+                        // Bare `%`: copy the run including it and continue past it.
+                        decoded.extend_from_slice(&input[i..=percent]);
+                        i = percent + 1;
+                    }
+                }
+                None => {
+                    decoded.extend_from_slice(&input[i..]);
+                    break;
+                }
             }
         }
-        // Nothing to decode
-        None
+        Some(decoded)
     }
 
     /// Decode the result of percent-decoding as UTF-8.
@@ -477,5 +514,33 @@ mod tests {
             super::percent_decode(b"%00%9F%92%96").decode_utf8_lossy(),
             "\u{0}���"
         );
+    }
+
+    #[test]
+    fn percent_decode_bulk_runs_and_bare_percent() {
+        let cases: &[(&[u8], &[u8])] = &[
+            // Long unchanged run after the first escape is bulk-copied verbatim.
+            (b"a%20bcdefghijklmnop", b"a bcdefghijklmnop"),
+            // Multiple escapes with unchanged runs in between.
+            (b"one%20two%20three", b"one two three"),
+            // Bare `%` (no following hex) is kept literally, decoding continues.
+            (b"a%zzb%20c", b"a%zzb c"),
+            // Trailing `%` and truncated escapes are kept literally.
+            (b"x%20y%", b"x y%"),
+            (b"x%20y%2", b"x y%2"),
+            // `%` followed by a single valid hex then end.
+            (b"%4", b"%4"),
+            // Consecutive escapes with no unchanged bytes between them.
+            (b"%41%42%43", b"ABC"),
+        ];
+        for (input, expected) in cases {
+            let decoded: Cow<'_, [u8]> = super::percent_decode(input).into();
+            assert_eq!(decoded.as_ref(), *expected, "input {:?}", input);
+        }
+        // No escapes at all borrows the input unchanged.
+        assert!(matches!(
+            Cow::from(super::percent_decode(b"no-escapes-here")),
+            Cow::Borrowed(_)
+        ));
     }
 }
