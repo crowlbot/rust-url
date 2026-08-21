@@ -10,7 +10,6 @@ use crate::net::{Ipv4Addr, Ipv6Addr};
 use alloc::borrow::Cow;
 use alloc::borrow::ToOwned;
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::cmp;
 use core::fmt::{self, Formatter};
 
@@ -312,41 +311,68 @@ fn parse_ipv4number(mut input: &str) -> Result<Option<u32>, ()> {
         return Ok(Some(0));
     }
 
-    let valid_number = match r {
-        8 => input.as_bytes().iter().all(|c| (b'0'..=b'7').contains(c)),
-        10 => input.as_bytes().iter().all(|c| c.is_ascii_digit()),
-        16 => input.as_bytes().iter().all(|c| c.is_ascii_hexdigit()),
-        _ => false,
-    };
-    if !valid_number {
-        return Err(());
+    // Validate the digits and accumulate the value in a single pass. `overflow`
+    // mirrors the previous `u32::from_str_radix` behaviour (a valid but too-large
+    // number yields `Ok(None)`), while an invalid digit still yields `Err(())`
+    // regardless of overflow.
+    let mut num: u32 = 0;
+    let mut overflow = false;
+    for &c in input.as_bytes() {
+        let digit = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' if r == 16 => c - b'a' + 10,
+            b'A'..=b'F' if r == 16 => c - b'A' + 10,
+            _ => return Err(()),
+        };
+        if u32::from(digit) >= r {
+            // e.g. `8` or `9` in an octal number.
+            return Err(());
+        }
+        if !overflow {
+            match num.checked_mul(r).and_then(|n| n.checked_add(u32::from(digit))) {
+                Some(n) => num = n,
+                None => overflow = true,
+            }
+        }
     }
 
-    match u32::from_str_radix(input, r) {
-        Ok(num) => Ok(Some(num)),
-        Err(_) => Ok(None), // The only possible error kind here is an integer overflow.
-                            // The validity of the chars in the input is checked above.
+    if overflow {
+        Ok(None)
+    } else {
+        Ok(Some(num))
     }
 }
 
 /// <https://url.spec.whatwg.org/#concept-ipv4-parser>
 fn parse_ipv4addr(input: &str) -> ParseResult<Ipv4Addr> {
-    let mut parts: Vec<&str> = input.split('.').collect();
-    if parts.last() == Some(&"") {
-        parts.pop();
-    }
-    if parts.len() > 4 {
-        return Err(ParseError::InvalidIpv4Address);
-    }
-    let mut numbers: Vec<u32> = Vec::new();
-    for part in parts {
+    // A dotted-decimal IPv4 address has at most four parts, so collect them into
+    // a fixed array to avoid heap allocations. A single trailing empty part
+    // (from one trailing '.') is ignored, matching the previous behaviour of
+    // popping a trailing "" after `split('.')`.
+    let mut numbers = [0u32; 4];
+    let mut count = 0usize;
+    let mut parts = input.split('.').peekable();
+    while let Some(part) = parts.next() {
+        if part.is_empty() && parts.peek().is_none() {
+            break;
+        }
+        if count == 4 {
+            return Err(ParseError::InvalidIpv4Address);
+        }
         match parse_ipv4number(part) {
-            Ok(Some(n)) => numbers.push(n),
+            Ok(Some(n)) => {
+                numbers[count] = n;
+                count += 1;
+            }
             Ok(None) => return Err(ParseError::InvalidIpv4Address), // u32 overflow
             Err(()) => return Err(ParseError::InvalidIpv4Address),
         };
     }
-    let mut ipv4 = numbers.pop().expect("a non-empty list of numbers");
+    if count == 0 {
+        return Err(ParseError::InvalidIpv4Address);
+    }
+    let (numbers, last) = numbers[..count].split_at(count - 1);
+    let mut ipv4 = last[0];
     // Equivalent to: ipv4 >= 256 ** (4 − numbers.len())
     if ipv4 > u32::MAX >> (8 * numbers.len() as u32) {
         return Err(ParseError::InvalidIpv4Address);
