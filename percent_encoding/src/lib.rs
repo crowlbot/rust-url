@@ -249,12 +249,37 @@ pub struct PercentDecode<'a> {
     bytes: slice::Iter<'a, u8>,
 }
 
+/// Maps an ASCII byte to its hexadecimal-digit value (`0..=15`), or `NOT_HEX`
+/// (`0xFF`) if it is not a hex digit. A direct lookup avoids the range checks
+/// and branches of `char::to_digit(16)` on the per-escape decode hot path.
+const HEX_DIGIT: [u8; 256] = {
+    const NOT_HEX: u8 = 0xFF;
+    let mut table = [NOT_HEX; 256];
+    let mut i = 0u8;
+    while i < 10 {
+        table[(b'0' + i) as usize] = i;
+        i += 1;
+    }
+    let mut i = 0u8;
+    while i < 6 {
+        table[(b'a' + i) as usize] = 10 + i;
+        table[(b'A' + i) as usize] = 10 + i;
+        i += 1;
+    }
+    table
+};
+
 fn after_percent_sign(iter: &mut slice::Iter<'_, u8>) -> Option<u8> {
     let mut cloned_iter = iter.clone();
-    let h = char::from(*cloned_iter.next()?).to_digit(16)?;
-    let l = char::from(*cloned_iter.next()?).to_digit(16)?;
+    let h = HEX_DIGIT[*cloned_iter.next()? as usize];
+    let l = HEX_DIGIT[*cloned_iter.next()? as usize];
+    // A non-hex digit yields 0xFF; OR-ing keeps the high bits set in that case,
+    // so a single test rejects either invalid digit.
+    if (h | l) == 0xFF {
+        return None;
+    }
     *iter = cloned_iter;
-    Some(h as u8 * 0x10 + l as u8)
+    Some((h << 4) | l)
 }
 
 impl Iterator for PercentDecode<'_> {
@@ -426,6 +451,26 @@ mod tests {
                 .unwrap(),
             "foo bar?"
         );
+    }
+
+    #[test]
+    fn percent_decode_hex_digit_cases() {
+        // Upper- and lower-case hex digits both decode.
+        assert_eq!(super::percent_decode(b"%2f%2F").collect::<Vec<_>>(), b"//");
+        assert_eq!(super::percent_decode(b"%aB%Cd").collect::<Vec<_>>(), &[0xAB, 0xCD]);
+        // Every value 0x00..=0xFF round-trips through decode.
+        for byte in 0u16..=0xFF {
+            let encoded = alloc::format!("%{:02X}", byte);
+            assert_eq!(super::percent_decode(encoded.as_bytes()).collect::<Vec<_>>(), [byte as u8]);
+        }
+        // Non-hex digits leave the `%` (and following bytes) untouched.
+        assert_eq!(super::percent_decode(b"%2g").collect::<Vec<_>>(), b"%2g");
+        assert_eq!(super::percent_decode(b"%g2").collect::<Vec<_>>(), b"%g2");
+        assert_eq!(super::percent_decode(b"%zz").collect::<Vec<_>>(), b"%zz");
+        // Truncated escapes at end of input are left as literal bytes.
+        assert_eq!(super::percent_decode(b"%").collect::<Vec<_>>(), b"%");
+        assert_eq!(super::percent_decode(b"%a").collect::<Vec<_>>(), b"%a");
+        assert_eq!(super::percent_decode(b"abc%").collect::<Vec<_>>(), b"abc%");
     }
 
     #[test]
