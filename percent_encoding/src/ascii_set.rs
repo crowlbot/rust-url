@@ -6,7 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use core::{mem, ops};
+use core::ops;
 
 /// Represents a set of characters or bytes in the ASCII range.
 ///
@@ -24,62 +24,83 @@ use core::{mem, ops};
 /// /// https://url.spec.whatwg.org/#fragment-percent-encode-set
 /// const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
 /// ```
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AsciiSet {
-    mask: [Chunk; ASCII_RANGE_LEN / BITS_PER_CHUNK],
+    /// A direct 256-entry lookup table: `should[b]` is `true` when byte `b`
+    /// must be percent-encoded. Entries for the non-ASCII range (`0x80..=0xFF`)
+    /// are always `true`, since non-ASCII bytes are always encoded. Folding the
+    /// non-ASCII check into the table lets the hot per-byte scan in
+    /// `PercentEncode` be a single indexed load with no branch or bit-shift.
+    should: [bool; 256],
 }
-
-type Chunk = u32;
-
-const ASCII_RANGE_LEN: usize = 0x80;
-
-const BITS_PER_CHUNK: usize = 8 * mem::size_of::<Chunk>();
 
 impl AsciiSet {
     /// An empty set.
-    pub const EMPTY: Self = Self {
-        mask: [0; ASCII_RANGE_LEN / BITS_PER_CHUNK],
+    pub const EMPTY: Self = {
+        let mut should = [false; 256];
+        // Non-ASCII bytes are always percent-encoded.
+        let mut i = 0x80;
+        while i < 256 {
+            should[i] = true;
+            i += 1;
+        }
+        Self { should }
     };
 
     /// Called with UTF-8 bytes rather than code points.
     /// Not used for non-ASCII bytes.
     pub(crate) const fn contains(&self, byte: u8) -> bool {
-        let chunk = self.mask[byte as usize / BITS_PER_CHUNK];
-        let mask = 1 << (byte as usize % BITS_PER_CHUNK);
-        (chunk & mask) != 0
+        self.should[byte as usize]
     }
 
     pub(crate) fn should_percent_encode(&self, byte: u8) -> bool {
-        !byte.is_ascii() || self.contains(byte)
+        self.contains(byte)
     }
 
     pub const fn add(&self, byte: u8) -> Self {
-        let mut mask = self.mask;
-        mask[byte as usize / BITS_PER_CHUNK] |= 1 << (byte as usize % BITS_PER_CHUNK);
-        Self { mask }
+        let mut should = self.should;
+        should[byte as usize] = true;
+        Self { should }
     }
 
     pub const fn remove(&self, byte: u8) -> Self {
-        let mut mask = self.mask;
-        mask[byte as usize / BITS_PER_CHUNK] &= !(1 << (byte as usize % BITS_PER_CHUNK));
-        Self { mask }
+        let mut should = self.should;
+        // Non-ASCII bytes are always encoded and cannot be removed from the set.
+        if (byte as usize) < 0x80 {
+            should[byte as usize] = false;
+        }
+        Self { should }
     }
 
     /// Return the union of two sets.
     pub const fn union(&self, other: Self) -> Self {
-        let mask = [
-            self.mask[0] | other.mask[0],
-            self.mask[1] | other.mask[1],
-            self.mask[2] | other.mask[2],
-            self.mask[3] | other.mask[3],
-        ];
-        Self { mask }
+        let mut should = self.should;
+        let mut i = 0;
+        while i < 256 {
+            should[i] |= other.should[i];
+            i += 1;
+        }
+        Self { should }
     }
 
     /// Return the negation of the set.
     pub const fn complement(&self) -> Self {
-        let mask = [!self.mask[0], !self.mask[1], !self.mask[2], !self.mask[3]];
-        Self { mask }
+        let mut should = self.should;
+        // Only the ASCII range is flipped; non-ASCII bytes stay encoded.
+        let mut i = 0;
+        while i < 0x80 {
+            should[i] = !should[i];
+            i += 1;
+        }
+        Self { should }
+    }
+}
+
+impl core::fmt::Debug for AsciiSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_set()
+            .entries((0u16..0x80).filter(|&b| self.should[b as usize]))
+            .finish()
     }
 }
 
@@ -99,25 +120,28 @@ impl ops::Not for AsciiSet {
     }
 }
 
-/// The set of 0x00 to 0x1F (C0 controls), and 0x7F (DEL).
+/// The set of 0x00 to 0x1F (C0 controls), and 0x7F (DEL).
 ///
 /// Note that this includes the newline and tab characters, but not the space 0x20.
 ///
 /// <https://url.spec.whatwg.org/#c0-control-percent-encode-set>
-pub const CONTROLS: &AsciiSet = &AsciiSet {
-    mask: [
-        !0_u32, // C0: 0x00 to 0x1F (32 bits set)
-        0,
-        0,
-        1 << (0x7F_u32 % 32), // DEL: 0x7F (one bit set)
-    ],
+pub const CONTROLS: &AsciiSet = &{
+    let mut set = AsciiSet::EMPTY;
+    // C0 controls: 0x00 to 0x1F
+    let mut i = 0u8;
+    while i < 0x20 {
+        set = set.add(i);
+        i += 1;
+    }
+    // DEL: 0x7F
+    set.add(0x7F)
 };
 
 macro_rules! static_assert {
     ($( $bool: expr, )+) => {
         fn _static_assert() {
             $(
-                let _ = mem::transmute::<[u8; $bool as usize], u8>;
+                let _ = core::mem::transmute::<[u8; $bool as usize], u8>;
             )+
         }
     }
@@ -209,5 +233,16 @@ mod tests {
         assert!(!COMPLEMENT.contains(b'A'));
         assert!(!COMPLEMENT.contains(b'B'));
         assert!(COMPLEMENT.contains(b'C'));
+    }
+
+    /// Non-ASCII bytes are always encoded, regardless of set operations.
+    #[test]
+    fn non_ascii_always_encoded() {
+        assert!(AsciiSet::EMPTY.contains(0x80));
+        assert!(AsciiSet::EMPTY.contains(0xFF));
+        // `remove` and `complement` must never clear a non-ASCII entry.
+        assert!(AsciiSet::EMPTY.remove(0x80).contains(0x80));
+        assert!((!AsciiSet::EMPTY).contains(0x80));
+        assert!(NON_ALPHANUMERIC.contains(0xC3));
     }
 }
