@@ -128,8 +128,24 @@ pub struct ByteSerialize<'a> {
     bytes: &'a [u8],
 }
 
+/// Lookup table: `true` for the bytes that `application/x-www-form-urlencoded`
+/// serialization leaves unchanged (`*`, `-`, `.`, `_`, and ASCII
+/// alphanumerics). A single indexed load per byte is faster than the equivalent
+/// `matches!` range checks on the hot serialization scan.
+static SERIALIZED_UNCHANGED: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let byte = i as u8;
+        table[i] =
+            matches!(byte, b'*' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'_' | b'a'..=b'z');
+        i += 1;
+    }
+    table
+};
+
 fn byte_serialized_unchanged(byte: u8) -> bool {
-    matches!(byte, b'*' | b'-' | b'.' | b'0' ..= b'9' | b'A' ..= b'Z' | b'_' | b'a' ..= b'z')
+    SERIALIZED_UNCHANGED[byte as usize]
 }
 
 impl<'a> Iterator for ByteSerialize<'a> {
